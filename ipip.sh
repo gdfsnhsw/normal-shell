@@ -5,25 +5,6 @@ red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
-DATE=$(date +%Y%m%d)
-
-# 封装 rc.local 安全追加函数，避免 sed 删除错行
-append_rc_local() {
-    local cmd="$1"
-    if [[ ! -f /etc/rc.local ]]; then
-        cat > /etc/rc.local <<EOF
-#!/bin/sh -e
-# rc.local
-# This script is executed at the end of each multiuser runlevel.
-exit 0
-EOF
-        chmod +x /etc/rc.local
-    fi
-    # 删除原有的 exit 0，追加新命令后重新补上 exit 0
-    sed -i '/^exit 0$/d' /etc/rc.local
-    echo "$cmd" >> /etc/rc.local
-    echo "exit 0" >> /etc/rc.local
-}
 
 install_ipip(){
     if ! lsmod | grep -q "ipip"; then
@@ -38,98 +19,108 @@ install_ipip(){
 
     echo -ne "请输入对端设备的ddns域名或者IP："
     read ddnsname
-    read -p "请输入要创建的tun网卡名称：" tunname
+    read -p "请输入要创建的tun网卡名称(例如 tun0)：" tunname
     echo -ne "请输入tun网口的V-IP："
     read vip
     echo -ne "请输入对端的V-IP："
     read remotevip
 
-    # 更精准地获取主网卡和本地IP
-    netcardname=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
-    localip=$(ip -4 a show dev "$netcardname" | grep global | awk '{print $2}' | cut -d '/' -f 1 | head -1)
-
-    # ping 增加 -W 2 超时，防止挂起
-    remoteip=$(ping -4 -c 1 -W 2 "$ddnsname" | grep PING | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-    if [[ -z "$remoteip" ]]; then
-        remoteip=$ddnsname # 如果 ping 失败，假设输入的就是 IP
-    fi
-
-    rc_cmd="ip tunnel add $tunname mode ipip remote ${remoteip} local ${localip} ttl 64
-ip addr add ${vip}/30 dev $tunname
-ip link set $tunname up"
-
-    append_rc_local "$rc_cmd"
-
-    # 动态 IP 监控脚本
-    if [[ ! "$ddnsname" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        cat >/root/change-tunnel-ip_${ddnsname}.sh <<EOF
+    # 创建隧道启动脚本
+    cat > /usr/local/bin/ipip-up-${tunname}.sh <<EOF
 #!/bin/bash
-while true; do
-    remoteip=\$(ping -4 -c 1 -W 2 "$ddnsname" | grep PING | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-    if [[ "\$remoteip" != "" ]]; then
-        echo "获取对端设备的IP为: \$remoteip"
-        break
-    fi
-    sleep 2
-done
-oldip="\$(cat /root/.tunnel-ip.txt 2>/dev/null)"
+remoteip=\$(ping -4 -c 1 -W 2 "${ddnsname}" | grep PING | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+[[ -z "\$remoteip" ]] && remoteip="${ddnsname}"
+
 netcardname=\$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
 localip=\$(ip -4 a show dev "\$netcardname" | grep global | awk '{print \$2}' | cut -d '/' -f 1 | head -1)
 
-if [[ "\$oldip" != "\$remoteip" ]]; then
-    ip tunnel del $tunname
-    wg-quick down wg0 2>/dev/null
-    sed -i "/ip tunnel add $tunname mode ipip/c\ip tunnel add $tunname mode ipip remote \${remoteip} local \${localip} ttl 64" /etc/rc.local
-    systemctl restart rc-local
+ip tunnel add ${tunname} mode ipip remote \$remoteip local \$localip ttl 64
+ip addr add ${vip}/30 dev ${tunname}
+ip link set ${tunname} up
+ip route add ${remotevip}/32 dev ${tunname} scope link src ${vip}
+
+if ! iptables -t nat -L | grep -q "${remotevip}"; then
+    iptables -t nat -A POSTROUTING -s ${remotevip} -j MASQUERADE
+fi
+if ! sysctl -p | grep -q "net.ipv4.ip_forward = 1"; then
+    echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+    sysctl -p /etc/sysctl.conf
 fi
 EOF
-        echo "开始添加定时任务"
-        bashsrc=$(command -v bash)
-        # 清理旧的同名任务并添加新任务
-        crontab -l 2>/dev/null | grep -v "change-tunnel-ip_${ddnsname}.sh" > /root/crontab_test 
-        echo "*/2 * * * * ${bashsrc} /root/change-tunnel-ip_${ddnsname}.sh" >> /root/crontab_test 
-        crontab /root/crontab_test 
-        rm -f /root/crontab_test
+    chmod +x /usr/local/bin/ipip-up-${tunname}.sh
 
-        echo "-------------------------------------------------------"
-        echo -e "设置定时任务成功，当前系统所有定时任务清单如下:\n$(crontab -l)"
-        echo "-------------------------------------------------------"
-    fi
+    # 创建隧道停止脚本
+    cat > /usr/local/bin/ipip-down-${tunname}.sh <<EOF
+#!/bin/bash
+ip link set ${tunname} down
+ip tunnel del ${tunname}
+EOF
+    chmod +x /usr/local/bin/ipip-down-${tunname}.sh
 
-    echo "${remoteip}" > /root/.tunnel-ip.txt
-    ip tunnel add $tunname mode ipip remote ${remoteip} local $localip ttl 64
-    ip addr add ${vip}/30 dev $tunname
-    ip link set $tunname up
-    ip route add ${remotevip}/32 dev $tunname scope link src ${vip}
-
-    if ! iptables -t nat -L | grep -q "${remotevip}"; then
-        iptables -t nat -A POSTROUTING -s ${remotevip} -j MASQUERADE
-    fi
-    if ! sysctl -p | grep -q "net.ipv4.ip_forward = 1"; then
-        echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
-        sysctl -p /etc/sysctl.conf
-    fi
-
-    chmod +x /etc/rc.local
-    cat > /etc/systemd/system/rc-local.service <<EOF
+    # 创建隧道 systemd 服务
+    cat > /etc/systemd/system/ipip-${tunname}.service <<EOF
 [Unit]
-Description=/etc/rc.local Compatibility
-ConditionPathExists=/etc/rc.local
- 
+Description=IPIP Tunnel ${tunname}
+After=network.target
+
 [Service]
-Type=forking
-ExecStart=/etc/rc.local start
-TimeoutSec=0
-StandardOutput=tty
+Type=oneshot
 RemainAfterExit=yes
-SysVStartPriority=99
- 
+ExecStart=/usr/local/bin/ipip-up-${tunname}.sh
+ExecStop=/usr/local/bin/ipip-down-${tunname}.sh
+
 [Install]
 WantedBy=multi-user.target
 EOF
+
     systemctl daemon-reload
-    systemctl enable rc-local
-    echo "程序全部执行完毕，脚本退出。。"
+    systemctl enable ipip-${tunname}.service
+    systemctl restart ipip-${tunname}.service
+    echo "IPIP 隧道 ${tunname} 原生服务已启动"
+
+    # 如果是 DDNS 域名，创建守护进程服务监控变动 (取代 cron)
+    if [[ ! "$ddnsname" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        cat > /usr/local/bin/ipip-ddns-${tunname}.sh <<EOF
+#!/bin/bash
+while true; do
+    remoteip=\$(ping -4 -c 1 -W 2 "${ddnsname}" | grep PING | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+    oldip=\$(cat /root/.tunnel-ip-${tunname}.txt 2>/dev/null)
+    
+    if [[ -n "\$remoteip" && "\$remoteip" != "\$oldip" ]]; then
+        echo "\$remoteip" > /root/.tunnel-ip-${tunname}.txt
+        if [[ -n "\$oldip" ]]; then
+            echo "IP 发生变动: \$oldip -> \$remoteip, 正在重启隧道..."
+            systemctl restart ipip-${tunname}.service
+            # 若有关联的 wg，尝试平滑重连
+            systemctl restart wg-quick@wg0 2>/dev/null
+        fi
+    fi
+    sleep 120
+done
+EOF
+        chmod +x /usr/local/bin/ipip-ddns-${tunname}.sh
+
+        cat > /etc/systemd/system/ipip-ddns-${tunname}.service <<EOF
+[Unit]
+Description=IPIP DDNS Monitor for ${tunname}
+After=network.target ipip-${tunname}.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ipip-ddns-${tunname}.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable ipip-ddns-${tunname}.service
+        systemctl restart ipip-ddns-${tunname}.service
+        echo "DDNS 监控守护进程已独立启动 (每120秒检测一次)"
+    fi
+
+    echo "程序全部执行完毕，脚本退出。"
     exit 0
 }
 
@@ -149,102 +140,109 @@ install_ipipv6(){
     echo -ne "请输入对端的V-IP："
     read remotevip
 
-    netcardname=$(ip -6 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
-    if [[ -z "$netcardname" ]]; then
-        netcardname=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
-    fi
-    routerule=$(ip -6 route list | grep default | head -1 | awk '{print $1" "$2" "$3" "$4" "$5}')
-    localip6=$(ip -6 a show dev "$netcardname" | grep 'scope global' | awk '{print $2}' | cut -d '/' -f 1 | head -1)
+    read -p "当前机器是甲骨文吗？[Y/n]:" yn
 
-    remoteip=$(ping -6 -c 1 -W 2 "$ddnsname" | grep PING | grep -Eo '([0-9a-fA-F]{1,4}:)+[0-9a-fA-F]{1,4}' | head -n1)
-    if [[ -z "$remoteip" ]]; then
-        remoteip=$ddnsname
-    fi
-
-    # 动态 IP 监控脚本
-    if [[ ! "$ddnsname" =~ ":" ]]; then
-        cat >/root/change-tunnel-ipv6_${ddnsname}.sh <<EOF
+    # 创建隧道启动脚本
+    cat > /usr/local/bin/ipipv6-up-${tunname}.sh <<EOF
 #!/bin/bash
-while true; do
-    remoteip=\$(ping -6 -c 1 -W 2 "$ddnsname" | grep PING | grep -Eo '([0-9a-fA-F]{1,4}:)+[0-9a-fA-F]{1,4}' | head -n1)
-    if [[ "\$remoteip" != "" ]]; then
-        echo "获取对端设备的IP为: \$remoteip"
-        break
-    fi
-    sleep 2
-done
-oldip="\$(cat /root/.tunnel-ipv6.txt 2>/dev/null)"
-localip6=\$(ip -6 a | grep 'scope global' | awk '{print \$2}' | cut -d '/' -f 1 | head -1)
+netcardname=\$(ip -6 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+[[ -z "\$netcardname" ]] && netcardname=\$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
 
-if [[ "\$oldip" != "\$remoteip" ]]; then
-    ip tunnel del $tunname
-    wg-quick down wg0 2>/dev/null
-    sed -i "/ip link add name/c\ip link add name $tunname type ip6tnl local \${localip6} remote \${remoteip} mode any" /etc/rc.local
-    systemctl restart rc-local
+if [[ "${yn}" =~ ^[Yy]$ ]]; then
+    sleep 20s
+    dhclient -6 \$netcardname
+fi
+
+routerule=\$(ip -6 route list | grep default | head -1 | awk '{print \$1" "\$2" "\$3" "\$4" "\$5}')
+localip6=\$(ip -6 a show dev "\$netcardname" | grep 'scope global' | awk '{print \$2}' | cut -d '/' -f 1 | head -1)
+
+remoteip=\$(ping -6 -c 1 -W 2 "${ddnsname}" | grep PING | grep -Eo '([0-9a-fA-F]{1,4}:)+[0-9a-fA-F]{1,4}' | head -n1)
+[[ -z "\$remoteip" ]] && remoteip="${ddnsname}"
+
+ip link add name ${tunname} type ip6tnl local \${localip6} remote \${remoteip} mode any
+ip addr add ${vip}/30 dev ${tunname}
+ip link set ${tunname} up
+ip -6 route add \$routerule
+
+if ! iptables -t nat -L | grep -q "${remotevip}"; then
+    iptables -t nat -A POSTROUTING -s ${remotevip} -j MASQUERADE
+fi
+if ! sysctl -p | grep -q "net.ipv6.conf.all.forwarding=1"; then
+    echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
+    sysctl -p /etc/sysctl.conf
 fi
 EOF
-        bashsrc=$(command -v bash)
-        crontab -l 2>/dev/null | grep -v "change-tunnel-ipv6_${ddnsname}.sh" > /root/crontab_test 
-        echo "*/2 * * * * ${bashsrc} /root/change-tunnel-ipv6_${ddnsname}.sh" >> /root/crontab_test 
-        crontab /root/crontab_test 
-        rm -f /root/crontab_test
-    fi
+    chmod +x /usr/local/bin/ipipv6-up-${tunname}.sh
 
-    echo "${remoteip}" > /root/.tunnel-ipv6.txt
-    read -p "当前机器是甲骨文吗？[Y/n]:" yn
-    addtxt=""
-    addtxt1=""
-    if [[ "$yn" =~ ^[Yy]$ ]]; then
-        addtxt="dhclient -6 $netcardname"
-        addtxt1="sleep 20s"
-    fi
+    # 创建隧道停止脚本
+    cat > /usr/local/bin/ipipv6-down-${tunname}.sh <<EOF
+#!/bin/bash
+ip link set ${tunname} down
+ip tunnel del ${tunname}
+EOF
+    chmod +x /usr/local/bin/ipipv6-down-${tunname}.sh
 
-    rc_cmd="$addtxt1
-$addtxt
-ip link add name $tunname type ip6tnl local ${localip6} remote ${remoteip} mode any
-ip addr add ${vip}/30 dev $tunname
-ip link set $tunname up
-ip -6 route add $routerule"
-
-    append_rc_local "$rc_cmd"
-
-    # 执行创建
-    ip link add name $tunname type ip6tnl local ${localip6} remote ${remoteip} mode any
-    ip addr add ${vip}/30 dev $tunname
-    ip link set $tunname up
-    ip -6 route add $routerule
-
-    chmod +x /etc/rc.local
-    cat > /etc/systemd/system/rc-local.service <<EOF
+    # 创建 systemd 服务
+    cat > /etc/systemd/system/ipipv6-${tunname}.service <<EOF
 [Unit]
-Description=/etc/rc.local Compatibility
+Description=IPv6 IPIP Tunnel ${tunname}
 After=network.target
-ConditionPathExists=/etc/rc.local
- 
+
 [Service]
-Type=forking
-ExecStart=/etc/rc.local start
-TimeoutSec=0
-StandardOutput=tty
+Type=oneshot
 RemainAfterExit=yes
-SysVStartPriority=99
- 
+ExecStart=/usr/local/bin/ipipv6-up-${tunname}.sh
+ExecStop=/usr/local/bin/ipipv6-down-${tunname}.sh
+
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable rc-local
 
-    if ! iptables -t nat -L | grep -q "${remotevip}"; then
-        iptables -t nat -A POSTROUTING -s ${remotevip} -j MASQUERADE
+    systemctl daemon-reload
+    systemctl enable ipipv6-${tunname}.service
+    systemctl restart ipipv6-${tunname}.service
+    echo "IPv6 隧道 ${tunname} 服务已部署"
+
+    # DDNS 监控服务
+    if [[ ! "$ddnsname" =~ ":" ]]; then
+        cat > /usr/local/bin/ipipv6-ddns-${tunname}.sh <<EOF
+#!/bin/bash
+while true; do
+    remoteip=\$(ping -6 -c 1 -W 2 "${ddnsname}" | grep PING | grep -Eo '([0-9a-fA-F]{1,4}:)+[0-9a-fA-F]{1,4}' | head -n1)
+    oldip=\$(cat /root/.tunnel-ipv6-${tunname}.txt 2>/dev/null)
+    if [[ -n "\$remoteip" && "\$remoteip" != "\$oldip" ]]; then
+        echo "\$remoteip" > /root/.tunnel-ipv6-${tunname}.txt
+        if [[ -n "\$oldip" ]]; then
+            systemctl restart ipipv6-${tunname}.service
+            systemctl restart wg-quick@wg0 2>/dev/null
+        fi
     fi
-    if ! sysctl -p | grep -q "net.ipv6.conf.all.forwarding=1"; then
-        echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
-        sysctl -p /etc/sysctl.conf
+    sleep 120
+done
+EOF
+        chmod +x /usr/local/bin/ipipv6-ddns-${tunname}.sh
+
+        cat > /etc/systemd/system/ipipv6-ddns-${tunname}.service <<EOF
+[Unit]
+Description=IPv6 DDNS Monitor for ${tunname}
+After=network.target ipipv6-${tunname}.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ipipv6-ddns-${tunname}.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable ipipv6-ddns-${tunname}.service
+        systemctl restart ipipv6-ddns-${tunname}.service
     fi
 
     if [[ "$yn" =~ ^[Yy]$ ]]; then
-        echo -e "${red}提示:${plain}${yellow}你的机器是甲骨文，IPIPv6隧道生效,需要重启一次！${plain}"
+        echo -e "${red}提示:${plain}${yellow} 你的机器是甲骨文，服务可能需要系统彻底重置网卡才能完美工作。${plain}"
     fi
     exit 0
 }
@@ -260,8 +258,8 @@ install_wg(){
 
     read -p "请输入对端wg使用的V-ip地址:" revip
     read -p "请输入本机wg使用的v-ip地址:" localip1
-    read -p "请输入ros端wg的公钥内容:" rospublickey
-    read -p "请输入ros端wg调用的端口号:" wgport
+    read -p "请输入RouterOS端wg的公钥内容:" rospublickey
+    read -p "请输入RouterOS端wg调用的端口号:" wgport
 
     allowedip1=$(echo "$revip" | awk -F "." '{print $1"."$2"."$3}')
     
@@ -293,8 +291,10 @@ PersistentKeepalive = 25
 EOF
 
     chmod 600 "/etc/wireguard/$filename.conf"
-    append_rc_local "wg-quick up $filename"
-    wg-quick up "$filename"
+    
+    # 彻底使用 systemctl 管理 WireGuard
+    systemctl enable wg-quick@${filename}
+    systemctl start wg-quick@${filename}
 
     vpspublickey=$(cat /etc/wireguard/publickey)
     linstenport=$(grep "ListenPort" "/etc/wireguard/$filename.conf" | awk '{print $3}')
@@ -302,7 +302,7 @@ EOF
     
     echo "    "
     echo -e "${green}------------------------------------------------------------${plain}"
-    echo -e "${green}请在ROS的wireguard选项卡里边的Peers里添加配置，具体填写如下信息：${plain}"
+    echo -e "${green}请在 MikroTik RouterOS 的 wireguard 选项卡里边的 Peers 里添加配置，具体填写如下信息：${plain}"
     echo -e "Public key 填写：${yellow}${vpspublickey}${plain}"
     if [[ "$filename" == "wg0" && -n "$vip" ]]; then
         echo -e "Endpoint 填写：${yellow}${vip}${plain}"
@@ -313,16 +313,34 @@ EOF
 
 keep_alive(){
     read -p "请输入对端ipip隧道IP：" remoteip_1
-    cat > /root/keepalive.sh <<EOF
+    cat > /usr/local/bin/ipip-keepalive.sh <<EOF
 #!/bin/bash
 while true; do
     ping -4 -c 1 -W 2 "${remoteip_1}" >/dev/null 2>&1
     sleep 2
 done
 EOF
-    append_rc_local "nohup bash /root/keepalive.sh >/dev/null 2>&1 &"
-    nohup bash /root/keepalive.sh >/dev/null 2>&1 &
-    echo -e "${yellow}IPIP隧道保活配置完成${plain}"
+    chmod +x /usr/local/bin/ipip-keepalive.sh
+
+    cat > /etc/systemd/system/ipip-keepalive.service <<EOF
+[Unit]
+Description=IPIP Tunnel Keepalive Ping
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ipip-keepalive.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable ipip-keepalive.service
+    systemctl start ipip-keepalive.service
+    echo -e "${yellow}IPIP隧道原生保活服务配置完成，已在后台运行。${plain}"
 }
 
 copyright(){
@@ -330,8 +348,8 @@ copyright(){
     echo -e "
 ${green}###########################################################${plain}
 ${green}#                                                         #${plain}
-${green}#       IPIP tunnel隧道、Wireguard一键部署脚本            #${plain}
-${green}#               Power By:翔翎                             #${plain}
+${green}#        IPIP tunnel隧道、Wireguard一键部署脚本 (Systemd版)    #${plain}
+${green}#                Power By:翔翎                              #${plain}
 ${green}#                                                         #${plain}
 ${green}###########################################################${plain}"
 }
